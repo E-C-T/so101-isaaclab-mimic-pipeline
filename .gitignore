@@ -1,0 +1,90 @@
+# -----------------------------
+# Python / environments
+# -----------------------------
+.venv/
+venv/
+env/
+*.py[oc]
+__pycache__/
+**/__pycache__/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+.DS_Store
+
+# -----------------------------
+# Build artifacts
+# -----------------------------
+build/
+dist/
+wheels/
+**/build*/
+**/cmake-build*/
+*.so
+
+# -----------------------------
+# Isaac / Omniverse / simulation
+# -----------------------------
+*.dmp
+.thumbs/
+**/.thumbs/
+_isaac_sim*
+_repo/
+_build/
+.lastformat
+
+# USD assets can be very large and are usually external/generated.
+*.usd
+*.usda
+*.usdc
+*.usdz
+
+# -----------------------------
+# Generated data / logs / outputs
+# -----------------------------
+datasets/
+logs/
+outputs/
+runs/
+recordings/
+wandb/
+**/wandb/
+**/.neptune/
+docker/artifacts/
+tmp/
+*.tmp
+
+# Isaac/Hydra/RL logs
+*.log
+*.log.*
+events.out.tfevents.*
+model_*.pt
+*.pt
+*.pth
+*.ckpt
+
+# Dataset and media artifacts
+*.hdf5
+*.h5
+*.parquet
+*.tar
+*.tar.gz
+*.npz
+*.npy
+*.mp4
+*.avi
+*.mov
+*.mkv
+
+# Debug image dumps
+*.png
+*.jpg
+*.jpeg
+
+# Pre-trained checkpoints
+.pretrained_checkpoints/
+# Local repo backups / temporary old docs
+.git_backup_before_first_commit_*/
+README_old.md
