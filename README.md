@@ -546,11 +546,8 @@ uv run python "$SO101_REPO/tools/vla_foundry_so101/vla_vibe_check.py" \
 
 This plots:
 
-```text
-ground-truth normalized action vs predicted normalized action
-ground-truth denormalized action vs predicted denormalized action
-camera views used by the policy
-```
+<img width="2100" height="3150" alt="vibe_sample_000025" src="https://github.com/user-attachments/assets/1afab950-a8ec-433d-b0f6-c36f529067d1" />
+
 
 ### Anchor sweep
 
