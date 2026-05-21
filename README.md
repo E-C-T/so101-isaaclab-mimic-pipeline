@@ -5,7 +5,7 @@ This repository contains an Isaac Lab workflow for an SO-ARM101 / SO101 cube pic
 The repository should track **code, configuration, and documentation only**. Large datasets, generated videos, model checkpoints, logs, and rendered artifacts should stay outside Git.
 
 <img width="1776" height="1121" alt="Annotation_Visual_Debug" src="https://github.com/user-attachments/assets/7fe691a1-3350-46d9-b368-adaa69a81724" />
-(_Subtask Annotation Visual Debugger_, tools/mimic/annotate_demos_so101.py --debug) 
+(Subtask Annotation Visual Debugger, tools/mimic/annotate_demos_so101.py --debug) 
 
 ---
 
