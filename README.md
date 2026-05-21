@@ -393,6 +393,8 @@ data/demo_X/camera_obs/up     [T, H, W, 3] uint8
 
 ## Step 7: export camera-augmented Isaac HDF5 to LeRobot
 
+Use `--reference-info "$REFERENCE_INFO"` to preserve the source dataset schema/FPS conventions, and use `--state-source absolute_joint_position` so that `observation.state` is exported from the absolute simulator joint state rather than the relative Isaac policy observation.
+
 ### Standard LeRobot export
 
 ```bash
@@ -401,6 +403,7 @@ python "$SO101_REPO/tools/data/convert_isaac_hdf5_to_lerobot_so101.py" \
   --out "$DATASET_DIR/lerobot_mimic_camera" \
   --reference-info "$REFERENCE_INFO" \
   --fallback-source-fps 50 \
+  --state-source absolute_joint_position \
   --task "Pick up the cube and place it in the goal region." \
   --only-with-cameras \
   --video-codec libx264 \
@@ -416,6 +419,7 @@ python "$SO101_REPO/tools/data/convert_isaac_hdf5_to_lerobot_so101.py" \
   --out "$DATASET_DIR/lerobot_mimic_vla_compat" \
   --reference-info "$REFERENCE_INFO" \
   --fallback-source-fps 50 \
+  --state-source absolute_joint_position \
   --task "Pick up the cube and place it in the goal region." \
   --only-with-cameras \
   --video-codec libx264 \
@@ -432,6 +436,7 @@ python "$SO101_REPO/tools/data/convert_isaac_hdf5_to_lerobot_so101.py" \
   --out "$DATASET_DIR/lerobot_mimic_vla_compat_subset" \
   --reference-info "$REFERENCE_INFO" \
   --fallback-source-fps 50 \
+  --state-source absolute_joint_position \
   --task "Pick up the cube and place it in the goal region." \
   --episode-indices 0,1 \
   --only-with-cameras \
@@ -458,9 +463,11 @@ print(df.head())
 PY
 ```
 
-Expected image columns:
+Expected key columns:
 
 ```text
+observation.state
+action
 observation.images.wrist
 observation.images.up
 ```
@@ -586,9 +593,9 @@ Run:
   --checkpoint_dir /path/to/vla_checkpoint_dir \
   --max_steps 800 \
   --reset_steps 12 \
-  --warm_start_action="-0.135,-1.62,1.69,1.29,-1.759,0.36" \
+  --warm_start_action="-0.13564736,-1.62364730,1.68500000,1.31176210,-1.75949300,0.03890861" \
   --warm_start_steps 200 \
-  --replan_steps 10 \
+  --replan_steps 60 \
   --execute_start_offset 1 \
   --num_inference_steps 10 \
   --respect_policy_fps \
@@ -675,6 +682,19 @@ Some preprocessing code indexes episode metadata using `entries[episode_index]`,
 ### VLA Foundry relative checkpoint paths
 
 VLA Foundry model configs may contain relative checkpoint paths. Run offline diagnostics from the VLA Foundry repository root, or ensure the evaluator changes current working directory to the VLA Foundry root before model construction.
+
+
+### Absolute versus relative joint states
+
+Isaac Lab HDF5 files can contain both relative policy observations and absolute simulator states. For this pipeline, VLA-compatible LeRobot exports should use:
+
+```text
+observation.state <- states/articulation/robot/joint_position
+action            <- processed_actions or actions
+```
+
+Do not accidentally export `obs/joint_pos` as `observation.state` if that task records `mdp.joint_pos_rel`; this can produce a large constant offset between training proprioception and live Isaac Lab evaluation.
+
 
 ### Large batch size can reduce optimizer steps
 
