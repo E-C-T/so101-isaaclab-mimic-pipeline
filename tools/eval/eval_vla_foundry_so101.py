@@ -1,11 +1,3 @@
-
-def checkpoint_sort_key(path):
-    import re
-    name = Path(path).name
-    m = re.search(r"checkpoint_(\d+)\.pt$", name)
-    return int(m.group(1)) if m else -1
-
-#!/usr/bin/env python3
 """
 Evaluate a VLA Foundry diffusion-policy checkpoint directly inside Isaac Lab.
 
@@ -45,6 +37,16 @@ from functools import partial
 print = partial(builtins.print, flush=True)
 from dataclasses import dataclass
 from typing import Any
+from pathlib import Path
+
+
+def checkpoint_sort_key(path):
+    """Sort checkpoint_*.pt files by numeric checkpoint index."""
+    import re
+
+    name = Path(path).name
+    m = re.search(r"checkpoint_(\d+)\.pt$", name)
+    return int(m.group(1)) if m else -1
 
 import numpy as np
 import torch
@@ -471,7 +473,10 @@ class VLAFoundrySO101Runner:
         self.num_inference_steps = num_inference_steps
         self.clip_to_action_stats = clip_to_action_stats
 
-        ckpts = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoints", "checkpoint_*.pt")))
+        ckpts = sorted(
+            glob.glob(os.path.join(checkpoint_dir, "checkpoints", "checkpoint_*.pt")),
+            key=checkpoint_sort_key,
+        )
         if not ckpts:
             raise FileNotFoundError(f"No checkpoint_*.pt found in {checkpoint_dir}/checkpoints")
         self.ckpt_path = ckpts[-1]
