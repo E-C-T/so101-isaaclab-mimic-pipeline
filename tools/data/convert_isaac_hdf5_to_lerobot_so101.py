@@ -858,15 +858,24 @@ def convert(args: argparse.Namespace) -> None:
         for ep_idx, demo_name in enumerate(demos):
             demo = h5["data"][demo_name]
 
-            # State: match seed LeRobot dataset: 6-D SO101 joint positions.
+            # State: 6-D SO101 absolute measured joint positions.
+            #
+            # Important:
+            #   obs/joint_pos is the Isaac Lab policy observation term and may be
+            #   relative joint position because the task config uses mdp.joint_pos_rel.
+            #   For LeRobot/VLA training we want observation.state to be in the same
+            #   coordinate convention as the absolute joint-position action targets.
+            #
+            # Prefer the recorder/exported absolute articulation state when present.
             state_path, state_ds = find_first_existing_dataset(
                 demo,
                 [
-                    "obs/joint_pos",
-                    "obs/qpos",
+                    "states/articulation/robot/joint_position",
                     "obs/robot_state/joint_pos",
                     "observations/joint_pos",
                     "joint_pos",
+                    "obs/qpos",
+                    "obs/joint_pos",
                 ],
             )
             state_raw = to_numpy(state_ds, dtype=np.float32)
