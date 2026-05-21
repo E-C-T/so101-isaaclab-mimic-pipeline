@@ -2,6 +2,13 @@
 from __future__ import annotations
 import argparse, io, json, os, tarfile
 from pathlib import Path
+
+def checkpoint_sort_key(path):
+    import re
+    name = Path(path).name
+    m = re.search(r"checkpoint_(\d+)\.pt$", name)
+    return int(m.group(1)) if m else -1
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
@@ -13,29 +20,81 @@ from vla_foundry.models import create_model
 from vla_foundry.params.model_params import ModelParams
 from vla_foundry.params.train_experiment_params import load_params_from_yaml
 
-def read_sample_from_tar(tar_path: Path, sample_index: int = 0) -> dict:
-    raw = {}
+def get_sample_prefixes(tar_path: Path) -> list[str]:
+    """Return unique sample prefixes in shard order."""
     with tarfile.open(tar_path, "r") as tar:
         members = tar.getmembers()
         prefixes, last = [], None
         for m in members:
             prefix = m.name.split(".")[0]
             if prefix != last:
-                prefixes.append(prefix); last = prefix
+                prefixes.append(prefix)
+                last = prefix
+    return prefixes
+
+
+def read_sample_from_tar(tar_path: Path, sample_index: int = 0) -> dict:
+    """Read a sample by local index inside one tar shard."""
+    raw = {}
+    with tarfile.open(tar_path, "r") as tar:
+        members = tar.getmembers()
+        prefixes = get_sample_prefixes(tar_path)
+
+        if sample_index < 0 or sample_index >= len(prefixes):
+            raise IndexError(
+                f"sample_index={sample_index} out of range for {tar_path.name}; "
+                f"this shard contains {len(prefixes)} samples."
+            )
+
         sample_id = prefixes[sample_index]
+
         for m in members:
-            if not m.name.startswith(sample_id + "."): continue
+            if not m.name.startswith(sample_id + "."):
+                continue
+
             suffix = m.name[len(sample_id) + 1:]
             f = tar.extractfile(m)
-            if f is None: continue
+            if f is None:
+                continue
+
             payload = f.read()
             if suffix.endswith((".jpg", ".jpeg", ".png")):
-                raw[suffix] = torch.from_numpy(np.array(Image.open(io.BytesIO(payload)).convert("RGB"))).permute(2,0,1)
+                raw[suffix] = torch.from_numpy(
+                    np.array(Image.open(io.BytesIO(payload)).convert("RGB"))
+                ).permute(2, 0, 1)
             elif suffix.endswith(".npz"):
                 raw[suffix] = dict(np.load(io.BytesIO(payload)))
             elif suffix.endswith(".json"):
                 raw[suffix] = json.load(io.BytesIO(payload))
+
     return raw
+
+
+def read_global_sample_from_shards(preproc_root: Path, global_sample_index: int) -> dict:
+    """Read a sample by global sample index across all shard_*.tar files."""
+    shard_paths = sorted((preproc_root / "shards").glob("shard_*.tar"))
+    if not shard_paths:
+        raise FileNotFoundError(f"No shard_*.tar files found under {preproc_root / 'shards'}")
+
+    remaining = int(global_sample_index)
+    total = 0
+
+    for shard_path in shard_paths:
+        n = len(get_sample_prefixes(shard_path))
+        if remaining < n:
+            print(
+                f"[INFO] global sample {global_sample_index} -> "
+                f"{shard_path.name}, local sample {remaining}"
+            )
+            return read_sample_from_tar(shard_path, remaining)
+
+        remaining -= n
+        total += n
+
+    raise IndexError(
+        f"global sample index {global_sample_index} out of range; "
+        f"dataset contains {total} samples across {len(shard_paths)} shards."
+    )
 
 def main():
     p = argparse.ArgumentParser(description="Offline SO101 VLA vibe check: GT vs predicted action sequence.")
@@ -54,7 +113,7 @@ def main():
     preproc_root = Path(args.preproc_root).resolve()
     out_dir = Path(args.out_dir).resolve(); out_dir.mkdir(parents=True, exist_ok=True)
 
-    ckpt = sorted((checkpoint_dir / "checkpoints").glob("checkpoint_*.pt"))[-1]
+    ckpt = sorted((checkpoint_dir / "checkpoints").glob("checkpoint_*.pt"), key=checkpoint_sort_key)[-1]
     print("[INFO] checkpoint_dir:", checkpoint_dir)
     print("[INFO] checkpoint:", ckpt)
     model_params = load_params_from_yaml(ModelParams, str(checkpoint_dir / "config_model.yaml"))
@@ -71,8 +130,14 @@ def main():
     print("past:", data_params.lowdim_past_timesteps)
     print("future:", data_params.lowdim_future_timesteps)
 
-    tar_path = sorted((preproc_root / "shards").glob("shard_*.tar"))[args.tar_index]
-    raw_sample = read_sample_from_tar(tar_path, args.sample_index)
+    if args.tar_index != 0:
+        # Backwards-compatible local shard mode if explicitly requested.
+        tar_path = sorted((preproc_root / "shards").glob("shard_*.tar"))[args.tar_index]
+        print(f"[INFO] tar-index mode: {tar_path.name}, local sample {args.sample_index}")
+        raw_sample = read_sample_from_tar(tar_path, args.sample_index)
+    else:
+        # Default behavior: sample-index is global across all shards.
+        raw_sample = read_global_sample_from_shards(preproc_root, args.sample_index)
     metadata = raw_sample.get("metadata.json", {})
     lowdim = raw_sample.get("lowdim.npz", {})
     anchor = metadata.get("original_anchor_relative_idx", metadata.get("anchor_relative_idx", None))

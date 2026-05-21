@@ -1,3 +1,10 @@
+
+def checkpoint_sort_key(path):
+    import re
+    name = Path(path).name
+    m = re.search(r"checkpoint_(\d+)\.pt$", name)
+    return int(m.group(1)) if m else -1
+
 #!/usr/bin/env python3
 """
 Evaluate a VLA Foundry diffusion-policy checkpoint directly inside Isaac Lab.

@@ -2,6 +2,13 @@
 from __future__ import annotations
 import argparse, io, json, os, tarfile
 from pathlib import Path
+
+def checkpoint_sort_key(path):
+    import re
+    name = Path(path).name
+    m = re.search(r"checkpoint_(\d+)\.pt$", name)
+    return int(m.group(1)) if m else -1
+
 import matplotlib.pyplot as plt
 import numpy as np
 import torch
