@@ -125,12 +125,6 @@ from typing import Any
 
 import gymnasium as gym
 import torch
-try:
-    from isaacsim.util.debug_draw import _debug_draw
-    DEBUG_DRAW_AVAILABLE = True
-except Exception:
-    _debug_draw = None
-    DEBUG_DRAW_AVAILABLE = False
 
 import isaaclab_mimic.envs  # noqa: F401
 
@@ -367,184 +361,6 @@ def _print_initial_state_summary(initial_state: dict):
                     log_debug(f"[RESET DEBUG] {asset_type}/{asset_name}/{state_name}: type={type(state_value)}")
 
 
-def _get_debug_draw():
-    if not DEBUG_DRAW_AVAILABLE:
-        return None
-
-    try:
-        return _debug_draw.acquire_debug_draw_interface()
-    except Exception:
-        return None
-
-# -----------------------------------------------------------------------------
-# Debug visualization helpers
-# -----------------------------------------------------------------------------
-_debug_trail_history = []
-
-# _SUBTASK_COLORS = {
-#     "none": (1.0, 0.0, 0.0, 0.35),
-#     "object_lifted": (1.0, 0.85, 0.0, 0.35),
-#     "object_above_goal": (0.0, 1.0, 0.0, 0.35),
-#     "object_in_goal": (0.1, 0.35, 0.9, 0.35),
-# }
-
-# _SUBTASK_COLORS = {
-#     "none": (0.75, 0.20, 0.20, 0.22),
-#     "object_lifted": (0.75, 0.60, 0.15, 0.22),
-#     "object_above_goal": (0.20, 0.70, 0.25, 0.22),
-#     "object_in_goal": (0.20, 0.40, 0.70, 0.22),
-# }
-
-_SUBTASK_COLORS = {
-    "none": (1.0, 0.0, 0.0, 0.35),
-    "object_lifted": (1.0, 0.8, 0.0, 0.35),
-    "object_above_goal": (0.0, 1.0, 0.0, 0.35),
-    "object_in_goal": (0.1, 0.1, 1.0, 0.35),
-}
-
-_debug_trail_history = []
-
-
-def _draw_debug_point(position, color=(0.0, 1.0, 0.0, .15), size=15.0):
-    draw = _get_debug_draw()
-
-    if draw is None:
-        return
-    
-    try:
-        draw.draw_points(
-            [(float(position[0]), float(position[1]), float(position[2]))],
-            [color],
-            [size],
-        )
-
-    except Exception as exc:
-        print(f"[DRAW POINT ERROR] {type(exc).__name__}: {exc}")
-
-
-def _draw_goal_region(env):
-    try:
-        if not hasattr(env.cfg, "goal_region"):
-            return
-
-        region = env.cfg.goal_region
-
-        x_min = region["x_min"]
-        x_max = region["x_max"]
-        y_min = region["y_min"]
-        y_max = region["y_max"]
-
-        z = 0.02
-
-        corners = [
-            (x_min, y_min, z),
-            (x_max, y_min, z),
-            (x_max, y_max, z),
-            (x_min, y_max, z),
-        ]
-
-        draw = _get_debug_draw()
-
-        if draw is None:
-            return
-
-        colors = [(1.0, 0.0, 0.0, 1.0)] * 4
-        sizes = [15.0] * 4
-
-        draw.draw_points(corners, colors, sizes)
-
-    except Exception as exc:
-        print(f"[GOAL REGION DRAW ERROR] {type(exc).__name__}: {exc}")
-
-
-def _draw_object_root(env):
-    try:
-        obj = env.scene["object"]
-        root_state = obj.data.root_state_w[0]
-
-        pos = root_state[0:3].detach().cpu().numpy()
-
-        _draw_debug_point(
-            pos,
-            color=(0.0, 1.0, 0.0, 0.35),
-            size=15.0,
-        )
-
-    except Exception as exc:
-        print(f"[OBJECT ROOT DRAW ERROR] {type(exc).__name__}: {exc}")
-
-
-def _draw_object_trail(env, step_idx):
-    global _debug_trail_history
-
-    try:
-        obj = env.scene["object"]
-        root_state = obj.data.root_state_w[0]
-
-        pos = root_state[0:3].detach().cpu().numpy()
-
-        signals = env.get_subtask_term_signals()
-
-        active_subtask = "none"
-
-        if bool(signals["object_in_goal"][0]):
-            active_subtask = "object_in_goal"
-        elif bool(signals["object_above_goal"][0]):
-            active_subtask = "object_above_goal"
-        elif bool(signals["object_lifted"][0]):
-            active_subtask = "object_lifted"
-
-        _debug_trail_history.append({
-            "pos": (
-                float(pos[0]),
-                float(pos[1]),
-                float(pos[2]),
-            ),
-            "subtask": active_subtask,
-            "step": step_idx,
-        })
-
-        MAX_TRAIL = 10000
-
-        if len(_debug_trail_history) > MAX_TRAIL:
-            _debug_trail_history.pop(0)
-
-        draw = _get_debug_draw()
-
-        if draw is None:
-            return
-
-        points = []
-        colors = []
-        sizes = []
-
-        history_len = len(_debug_trail_history)
-
-        for i, item in enumerate(_debug_trail_history):
-
-            base_color = _SUBTASK_COLORS[item["subtask"]]
-
-            color = (
-                base_color[0],
-                base_color[1],
-                base_color[2],
-                0.35,
-            )
-
-            points.append(item["pos"])
-            colors.append(color)
-            sizes.append(13.0)
-
-        draw.draw_points(
-            points,
-            colors,
-            sizes,
-        )
-
-    except Exception as exc:
-        print(f"[TRAIL DRAW ERROR] {type(exc).__name__}: {exc}")
-
-
 # -----------------------------------------------------------------------------
 # Main
 # -----------------------------------------------------------------------------
@@ -739,11 +555,7 @@ def replay_episode(
     success_term: TerminationTermCfg | None = None,
 ) -> bool:
     """Replay one episode using the same reset/action stepping semantics as SO-101 replay scripts."""
-    global current_action_index, skip_episode, is_paused, _debug_trail_history
-
-    DEBUG_CLEAR_TRAIL_EACH_EPISODE = False
-    if DEBUG_CLEAR_TRAIL_EACH_EPISODE:
-        _debug_trail_history.clear()
+    global current_action_index, skip_episode, is_paused
 
     initial_state = _get_episode_initial_state(episode)
 
@@ -765,10 +577,6 @@ def replay_episode(
     first_action = True
     step_idx = 0
     last_action = None
-    seen_subtask_signals = set()
-    subtask_first_step = {}
-    subtask_last_step = {}
-    subtask_counts = {}
 
     # Iterate using EpisodeData.get_next_action() to match replay_demos.py/filter_successful_replays.py behavior.
     while True:
@@ -795,60 +603,6 @@ def replay_episode(
 
         env.step(actions)
 
-        # --------------------------------------------------------------
-        # Debug visualization + subtask tracing
-        # --------------------------------------------------------------
-        try:
-            if args_cli.debug and not args_cli.headless:
-                _draw_goal_region(env)
-                _draw_object_root(env)
-                _draw_object_trail(env, step_idx)
-
-            signals = env.get_subtask_term_signals()
-
-            obj = env.scene["object"]
-            obj_root = obj.data.root_state_w[0]
-
-            obj_pos = obj_root[0:3].detach().cpu().numpy()
-            obj_lin_vel = obj_root[7:10].detach().cpu().numpy()
-
-            signal_summary = {}
-
-            for name, tensor in signals.items():
-                active = bool(tensor[0].detach().cpu())
-                signal_summary[name] = active
-
-                if active:
-                    subtask_counts[name] = subtask_counts.get(name, 0) + 1
-
-                    if name not in subtask_first_step:
-                        subtask_first_step[name] = step_idx
-
-                    subtask_last_step[name] = step_idx
-
-                if active and name not in seen_subtask_signals:
-                    seen_subtask_signals.add(name)
-
-                    print(
-                        f"\n[SUBTASK FIRST ACTIVATION] "
-                        f"step={step_idx} "
-                        f"signal={name} "
-                        f"obj_pos={obj_pos} "
-                        f"obj_vel={obj_lin_vel}\n"
-                    )
-
-            if args_cli.debug_every > 0 and step_idx % args_cli.debug_every == 0:
-                print(
-                f"[SUBTASK TRACE] "
-                f"step={step_idx} "
-                f"obj_pos={obj_pos} "
-                f"obj_vel={obj_lin_vel} "
-                f"signals={signal_summary}"
-                )
-
-        except Exception as exc:
-            print(f"[DEBUG TRACE ERROR] {type(exc).__name__}: {exc}")
-
         if args_cli.debug_every > 0 and step_idx % args_cli.debug_every == 0:
             _print_scene_debug(env, f"[REPLAY STEP DEBUG step={step_idx}]", success_term=success_term)
 
@@ -867,39 +621,6 @@ def replay_episode(
         log_debug("[REPLAY FINAL DEBUG] success_bool=", success_bool)
         if not success_bool:
             return False
-
-    print("\n================ EPISODE SUMMARY ================\n")
-
-    print(f"Total replay steps: {step_idx}")
-
-    ordered = sorted(
-        subtask_first_step.items(),
-        key=lambda x: x[1]
-    )
-
-    print("\nSubtask ordering:")
-
-    for name, first_step in ordered:
-
-        last_step = subtask_last_step.get(name, first_step)
-
-        duration = last_step - first_step
-
-        count = subtask_counts.get(name, 0)
-
-        pct = 100.0 * duration / max(step_idx, 1)
-
-        print(
-            f"{name:<24} "
-            f"first={first_step:<5} "
-            f"last={last_step:<5} "
-            f"frames={duration:<5} "
-            f"pct={pct:5.1f}% "
-            f"count={count}"
-        )
-
-    print("\n================================================\n")
-
     return True
 
 
