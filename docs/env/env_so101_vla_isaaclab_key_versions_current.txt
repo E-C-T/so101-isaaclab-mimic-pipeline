@@ -1,0 +1,24 @@
+Environment: env_so101_vla_isaaclab
+Machine: DGX Spark / GB10 workstation
+Purpose: Isaac Lab + VLA Foundry inference integration
+
+Known working:
+- Isaac Lab launcher can use this Conda Python.
+- VLA Foundry RoboticsProcessor loads.
+- VLA Foundry model loads.
+- generate_actions() works inside Isaac Lab-launched Python.
+- Live Isaac Lab evaluator runs camera-enabled SO101 env.
+
+Important caution:
+- VLA Foundry training/preprocessing still uses /home/insol02/IH_ws/vla_foundry uv environment.
+- Do not casually upgrade numpy, torch, torchvision, transformers, or draccus in this Conda env.
+
+Python: /home/insol02/miniconda3/envs/env_so101_vla_isaaclab/bin/python
+numpy: 1.26.0
+torch: 2.9.0+cu130
+torchvision: 0.24.0
+transformers: 4.57.6
+draccus: 0.8.0
+webdataset: 0.2.111
+timm: 1.0.15
+open_clip: 2.32.0

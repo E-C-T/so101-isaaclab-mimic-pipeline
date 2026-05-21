@@ -14,6 +14,10 @@ __pycache__/
 .ipynb_checkpoints/
 .DS_Store
 
+# Optional: local notebooks are usually experimental.
+# Remove this line if you want to commit tutorial notebooks.
+*.ipynb
+
 # -----------------------------
 # Build artifacts
 # -----------------------------
@@ -83,8 +87,32 @@ model_*.pt
 *.jpg
 *.jpeg
 
+# Allow documentation images if intentionally added later.
+!docs/**/*.png
+!docs/**/*.jpg
+!docs/**/*.jpeg
+
 # Pre-trained checkpoints
 .pretrained_checkpoints/
+
+# -----------------------------
 # Local repo backups / temporary old docs
+# -----------------------------
 .git_backup_before_first_commit_*/
-README_old.md
+.local_env_snapshots/
+README_old*.md
+
+# Environment dumps at repo root
+env_*_pip_freeze*.txt
+env_*_key_versions*.txt
+env_*_notes.txt
+
+# Keep curated docs
+!docs/
+!docs/env/
+!docs/local/
+!docs/archive/
+!docs/**/*.md
+!docs/**/*.txt
+!docs/**/*.yml
+!docs/**/*.yaml

@@ -1,343 +1,379 @@
-# SO101 Isaac Lab → Isaac Mimic → LeRobot/VLA Foundry Pipeline
+# SO101 Isaac Lab → Isaac Mimic → LeRobot / VLA Foundry Pipeline
 
-This repository contains a working Isaac Lab pipeline for the SO-ARM101 / SO101 cube pick-and-place task using the Isaac 4 Healthcare SO101 USD asset.
+This repository contains an Isaac Lab workflow for an SO-ARM101 / SO101 cube pick-and-place task. The pipeline supports dataset conversion, Isaac Lab replay, Isaac Mimic generation, camera rendering, LeRobot export, VLA Foundry preprocessing/training, offline diagnostics, and live Isaac Lab policy evaluation.
 
-The current pipeline supports:
-
-1. Converting SO101 LeRobot demonstrations into Isaac HDF5.
-2. Replaying and filtering successful Isaac trajectories.
-3. Annotating demonstrations for Isaac Mimic.
-4. Generating synthetic trajectories with Isaac Mimic.
-5. Replaying generated trajectories with camera sensors.
-6. Exporting camera-augmented Isaac HDF5 datasets back to LeRobot format.
-7. Creating VLA Foundry-compatible LeRobot exports for robotics preprocessing/training smoke tests.
-
-> This repository should track code, configs, and documentation only. Large datasets, generated HDF5 files, rendered videos, logs, and model checkpoints should stay out of Git.
+The repository should track **code, configuration, and documentation only**. Large datasets, generated videos, model checkpoints, logs, and rendered artifacts should stay outside Git.
 
 ---
 
-## 1. Repository layout
+## Contents
+
+- [Repository layout](#repository-layout)
+- [Environment strategy](#environment-strategy)
+- [Important conventions](#important-conventions)
+- [End-to-end workflow](#end-to-end-workflow)
+- [Step 0: configure paths](#step-0-configure-paths)
+- [Step 1: convert source LeRobot data to Isaac HDF5](#step-1-convert-source-lerobot-data-to-isaac-hdf5)
+- [Step 2: calibrate and replay the scene](#step-2-calibrate-and-replay-the-scene)
+- [Step 3: filter successful replays](#step-3-filter-successful-replays)
+- [Step 4: annotate demonstrations for Isaac Mimic](#step-4-annotate-demonstrations-for-isaac-mimic)
+- [Step 5: generate synthetic Mimic trajectories](#step-5-generate-synthetic-mimic-trajectories)
+- [Step 6: render camera observations for generated trajectories](#step-6-render-camera-observations-for-generated-trajectories)
+- [Step 7: export camera-augmented Isaac HDF5 to LeRobot](#step-7-export-camera-augmented-isaac-hdf5-to-lerobot)
+- [Step 8: preprocess LeRobot data for VLA Foundry](#step-8-preprocess-lerobot-data-for-vla-foundry)
+- [Step 9: train a VLA Foundry diffusion policy](#step-9-train-a-vla-foundry-diffusion-policy)
+- [Step 10: run offline VLA diagnostics](#step-10-run-offline-vla-diagnostics)
+- [Step 11: run live Isaac Lab VLA evaluation](#step-11-run-live-isaac-lab-vla-evaluation)
+- [Common pitfalls](#common-pitfalls)
+- [Git and data hygiene](#git-and-data-hygiene)
+
+---
+
+## Repository layout
 
 ```text
 src/isaac_so_arm101/
   robots/
-    i4h_so101/                     # Isaac 4 Healthcare SO101 USD robot config
-    trs_so101/                     # Original/URDF-based SO101 support
+    i4h_so101/                     # Isaac 4 Healthcare SO101 USD robot configuration
+    trs_so101/                     # Original / URDF-based SO101 support
   tasks/
     cube_replay_i4h/               # I4H replay environments and success checks
     cube_mimic_i4h/                # I4H Isaac Mimic environments
     camera_config/                 # camera sensor configuration
-  scripts/
-    calibrate_cube_scene.py        # visual/debug calibration helper
 
 tools/
   data/
     convert_lerobot_to_isaac_hdf5_so101.py
+    convert_isaac_hdf5_to_lerobot_so101.py
     inspect_hdf5.py
     replay_dataset_with_cameras.py
-    convert_isaac_hdf5_to_lerobot_so101.py
+
   mimic/
     annotate_demos_so101.py
     generate_dataset_so101.py
+
   debug/
+    calibrate_cube_scene.py
     filter_successful_replays.py
     debug_so101_frame_audit.py
     debug_replay_annotated_eef_targets.py
+
+  eval/
+    eval_vla_foundry_so101.py
+
+  vla_foundry_so101/
+    preprocess_so101.py
+    train_vla.py
+    vla_vibe_check.py
+    replay_gt_episode_isaaclab.py
+    vla_anchor_sweep.py
+    eval_vla_isaaclab_example.sh
+    README_DIAGNOSTICS.md
 ```
 
 ---
 
-## 2. Important I4H SO101 conventions
+## Environment strategy
 
-### 2.1 Calibrated robot root pose
+This project currently uses two environments:
 
-For the I4H SO101 USD asset, use:
+```text
+Isaac Lab / Isaac Sim environment
+  Use for Isaac Lab replay, Isaac Mimic, camera rendering, and live simulation evaluation.
+
+VLA Foundry environment
+  Use for VLA Foundry preprocessing, training, and offline diagnostics.
+```
+
+A single merged environment is convenient, but it is not required. Keeping training/preprocessing in the VLA Foundry environment reduces the risk of breaking Isaac Lab dependencies, especially packages such as NumPy, PyTorch, Transformers, Ray, and WebDataset.
+
+---
+
+## Important conventions
+
+### Calibrated robot root pose
+
+For the I4H SO101 USD asset, the calibrated root pose used in this pipeline is:
 
 ```text
 root position:   -0.02079, -0.01576, -0.03248
 root quaternion:  0.707,    0.0,      0.0,      0.707   # wxyz
 ```
 
-This compensates for the USD asset/base-frame offset and places the robot correctly in the cube pick-and-place scene.
+### Wrist-roll offset
 
-### 2.2 Wrist-roll offset
-
-When converting the original LeRobot demonstrations into Isaac HDF5, use:
+When converting original LeRobot demonstrations into Isaac HDF5, use:
 
 ```text
 --wrist-roll-offset-deg -155
 ```
 
-This aligns the wrist/gripper convention of the source demonstrations with the I4H USD asset convention.
+### Physics and control rate
 
-### 2.3 Physics/control rate
-
-The current pick/place configuration uses:
+The replay and camera task commonly use:
 
 ```text
-sim.dt      = 0.005  # 200 Hz physics
-decimation  = 4      # one action/env step every 4 physics steps
-env step dt = 0.02   # 50 Hz control/data rate
+sim.dt      = 0.005
+decimation  = 4
+env step dt = 0.02
+control FPS = 50
 ```
 
-The Isaac HDF5 trajectory rows are recorded per `env.step(...)`, not per raw PhysX substep. So the source FPS for generated state/action datasets is normally:
+If VLA training data is exported at another FPS, the live policy evaluator may need to respect the policy FPS during simulation.
 
-```text
-source_fps = 50
-```
-
-### 2.4 Camera vs no-camera tasks
+### Camera task versus no-camera task
 
 Use separate task variants for speed and reproducibility:
 
 ```text
-Isaac-SO-ARM101-Cube-I4H-Replay-v0
-  no active camera tensors
-  use for fast filtering, annotation, and no-camera replay
+Camera-disabled replay task
+  Use for fast replay, filtering, annotation, and dataset checks.
 
-Isaac-SO-ARM101-Cube-I4H-Replay-Camera-v0
-  active wrist/up camera sensors
-  use for replaying successful trajectories and saving camera observations
-
-Isaac-SO-ARM101-Cube-I4H-Pinocchio-Mimic-v0
-  Isaac Mimic environment using 6D joint-position actions
-  use for annotation and generation aligned with original teleop data
-
-Isaac-SO-ARM101-Cube-I4H-Diff-IK-Mimic-v0
-  Isaac Mimic environment using differential IK action semantics
-  useful for future experiments, but Pinocchio generation is currently the safer path
+Camera-enabled replay task
+  Use for camera rendering, visual calibration, and VLA evaluation.
 ```
 
-The gripper USD may contain an embedded camera prim that appears in the Isaac Sim viewport. That does not mean Isaac Lab is actively rendering camera tensors. The reliable check is:
+When running any camera-enabled task, pass:
 
-```python
-print(env.scene.keys())
+```bash
+--enable_cameras
 ```
 
 ---
 
-## 3. End-to-end pipeline
+## End-to-end workflow
 
 ```text
 LeRobot source dataset
   ↓
-convert_lerobot_to_isaac_hdf5_so101.py
-  ↓
 Isaac HDF5 replay dataset
   ↓
-calibrate_cube_scene.py
-  ↓
-filter_successful_replays.py
+Isaac Lab replay / calibration
   ↓
 successful replay HDF5
   ↓
-annotate_demos_so101.py
+Isaac Mimic annotation
   ↓
-Isaac Mimic annotated HDF5
+Isaac Mimic synthetic generation
   ↓
-generate_dataset_so101.py
+camera rendering replay
   ↓
-synthetic no-camera Mimic HDF5
+camera-augmented Isaac HDF5
   ↓
-replay_dataset_with_cameras.py
+LeRobot / VLA Foundry-compatible export
   ↓
-synthetic HDF5 with camera_obs/{wrist,up}
+VLA Foundry preprocessing
   ↓
-convert_isaac_hdf5_to_lerobot_so101.py
+VLA training
   ↓
-LeRobot / VLA Foundry-compatible dataset
+offline VLA diagnostics
+  ↓
+live Isaac Lab VLA evaluation
 ```
 
 ---
 
-## 4. Convert source LeRobot data to Isaac HDF5
+## Step 0: configure paths
+
+For copy-paste use, set shell variables once per terminal.
+
+```bash
+export ISAACLAB_ROOT=/path/to/IsaacLab
+export SO101_REPO=/path/to/so101_IsaacLab
+export VLA_FOUNDRY_ROOT=/path/to/vla_foundry
+
+export SOURCE_LEROBOT=/path/to/source_lerobot_dataset
+export REFERENCE_INFO=/path/to/source_lerobot_dataset/meta/info.json
+
+export DATASET_DIR=$SO101_REPO/datasets
+mkdir -p "$DATASET_DIR"
+```
+
+For Isaac Lab commands:
+
+```bash
+cd "$SO101_REPO"
+```
+
+For VLA Foundry commands:
+
+```bash
+cd "$VLA_FOUNDRY_ROOT"
+```
+
+---
+
+## Step 1: convert source LeRobot data to Isaac HDF5
 
 ### One episode
 
 ```bash
-python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_lerobot_to_isaac_hdf5_so101.py \
-  --repo-id /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place \
-  --root /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place \
+python "$SO101_REPO/tools/data/convert_lerobot_to_isaac_hdf5_so101.py" \
+  --repo-id "$SOURCE_LEROBOT" \
+  --root "$SOURCE_LEROBOT" \
   --env-name Isaac-SO-ARM101-Cube-I4H-Replay-v0 \
   --episode-index 0 \
   --root-pos="-0.02079,-0.01576,-0.03248" \
   --root-rot-wxyz="0.707,0.0,0.0,0.707" \
   --wrist-roll-offset-deg -155 \
-  --output-file /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_ep0_calibroot_wr-155.hdf5
+  --output-file "$DATASET_DIR/source_episode_000000_i4h.hdf5"
 ```
 
 ### Full dataset
 
 ```bash
-python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_lerobot_to_isaac_hdf5_so101.py \
-  --repo-id /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place \
-  --root /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place \
+python "$SO101_REPO/tools/data/convert_lerobot_to_isaac_hdf5_so101.py" \
+  --repo-id "$SOURCE_LEROBOT" \
+  --root "$SOURCE_LEROBOT" \
   --env-name Isaac-SO-ARM101-Cube-I4H-Replay-v0 \
   --root-pos="-0.02079,-0.01576,-0.03248" \
   --root-rot-wxyz="0.707,0.0,0.0,0.707" \
   --wrist-roll-offset-deg -155 \
-  --output-file /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_all_calibroot_wr-155.hdf5
+  --output-file "$DATASET_DIR/source_all_i4h.hdf5"
 ```
 
 ---
 
-## 5. Calibrate scene/replay
+## Step 2: calibrate and replay the scene
 
-Use calibration before filtering or Mimic generation. Verify that the robot base, wrist/gripper, cube, and goal region visually align.
+Use the interactive calibration script to verify base pose, object pose, gripper pose, goal region, and camera views.
 
-### Direct pose camera check
+### Direct pose check
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/src/isaac_so_arm101/scripts/calibrate_cube_scene.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/debug/calibrate_cube_scene.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Replay-Camera-v0 \
-  --dataset_file /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_ep0_calibroot_wr-155.hdf5 \
+  --dataset_file "$DATASET_DIR/source_episode_000000_i4h.hdf5" \
   --episode_index 0 \
-  --sample_index 300 \
+  --sample_index 100 \
   --mode direct_pose \
+  --save_camera_debug \
   --enable_cameras
 ```
 
 ### Action-step replay check
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/src/isaac_so_arm101/scripts/calibrate_cube_scene.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/debug/calibrate_cube_scene.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Replay-Camera-v0 \
-  --dataset_file /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_ep0_calibroot_wr-155.hdf5 \
+  --dataset_file "$DATASET_DIR/source_episode_000000_i4h.hdf5" \
   --episode_index 0 \
-  --sample_index 340 \
+  --sample_index 200 \
   --mode action_step \
   --step_size 20 \
+  --save_camera_debug \
   --enable_cameras
 ```
 
+Use `action_step` when you want to reset to the episode start and replay actions sequentially up to a target frame.
+
 ---
 
-## 6. Filter successful replays
+## Step 3: filter successful replays
 
-Use the no-camera replay task for speed.
+Use the no-camera task for speed.
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/debug/filter_successful_replays.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/debug/filter_successful_replays.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Replay-v0 \
-  --input-hdf5 /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_all_calibroot_wr-155.hdf5 \
-  --output-hdf5 /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_successful.hdf5 \
+  --input-hdf5 "$DATASET_DIR/source_all_i4h.hdf5" \
+  --output-hdf5 "$DATASET_DIR/source_successful_i4h.hdf5" \
   --check-mode ever_success
 ```
 
-Recommended:
-
-```text
-Use num_envs=1 unless the filtering script has been rewritten for true vectorized episode filtering.
-```
-
-Important multi-env success note: success checks must compare object positions in env-local coordinates, not raw world coordinates. If `num_envs > 1` works in GUI but success does not trigger for envs other than env 0, check for `root_state_w` vs `root_state_w - env.scene.env_origins`.
-
 ---
 
-## 7. Annotate demos for Isaac Mimic
+## Step 4: annotate demonstrations for Isaac Mimic
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/mimic/annotate_demos_so101.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/mimic/annotate_demos_so101.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Pinocchio-Mimic-v0 \
-  --input_file /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_successful.hdf5 \
-  --output_file /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_successful_annotated_$(date +%Y%m%d_%H%M%S).hdf5 \
+  --input_file "$DATASET_DIR/source_successful_i4h.hdf5" \
+  --output_file "$DATASET_DIR/source_successful_i4h_annotated_$(date +%Y%m%d_%H%M%S).hdf5" \
   --headless
 ```
 
-Avoid overwriting the same annotation file while debugging. If annotation crashes, HDF5 files can be left as tiny invalid files.
-
-### Inspect HDF5
+Inspect the result:
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/data/inspect_hdf5.py \
-  /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_successful_annotated.hdf5 \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/data/inspect_hdf5.py" \
+  "$DATASET_DIR/source_successful_i4h_annotated.hdf5" \
   --episode 0 \
   --stats
 ```
 
-### Optional safe copy
-
-```bash
-SAFE_ANNOTATED=/home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_successful_annotated_SAFE_$(date +%Y%m%d_%H%M%S).hdf5
-
-cp /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_i4h_successful_annotated.hdf5 "$SAFE_ANNOTATED"
-chmod a-w "$SAFE_ANNOTATED"
-```
-
 ---
 
-## 8. Generate synthetic Mimic data
+## Step 5: generate synthetic Mimic trajectories
 
 ### Small debug run
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/mimic/generate_dataset_so101.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/mimic/generate_dataset_so101.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Pinocchio-Mimic-v0 \
-  --input_file "$SAFE_ANNOTATED" \
-  --output_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_debug_1env_1trial_$(date +%Y%m%d_%H%M%S).hdf5 \
+  --input_file "$DATASET_DIR/source_successful_i4h_annotated.hdf5" \
+  --output_file "$DATASET_DIR/generated_mimic_debug_$(date +%Y%m%d_%H%M%S).hdf5" \
   --num_envs 1 \
   --generation_num_trials 1 \
   --debug
 ```
 
-### Moderate headless run
+### Larger headless run
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/mimic/generate_dataset_so101.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/mimic/generate_dataset_so101.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Pinocchio-Mimic-v0 \
-  --input_file "$SAFE_ANNOTATED" \
-  --output_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_32env_96trial_$(date +%Y%m%d_%H%M%S).hdf5 \
+  --input_file "$DATASET_DIR/source_successful_i4h_annotated.hdf5" \
+  --output_file "$DATASET_DIR/generated_mimic_$(date +%Y%m%d_%H%M%S).hdf5" \
   --num_envs 32 \
   --generation_num_trials 96 \
   --headless
 ```
 
-For small real datasets, start with roughly 2x to 5x synthetic expansion. For 29 teleop episodes, generate about 60–150 synthetic episodes first and validate quality before scaling.
-
 ---
 
-## 9. Replay generated trajectories with cameras
+## Step 6: render camera observations for generated trajectories
 
-Generate synthetic trajectories without cameras first, then replay successful generated trajectories with the camera task. This keeps generation fast and makes rendering a separate deterministic post-process.
+Generate trajectories without cameras first, then replay them in the camera-enabled task to record images.
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/data/replay_dataset_with_cameras.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/data/replay_dataset_with_cameras.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Replay-Camera-v0 \
-  --input_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_32env_96trial.hdf5 \
-  --output_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_32env_96trial_with_cameras.hdf5 \
+  --input_file "$DATASET_DIR/generated_mimic.hdf5" \
+  --output_file "$DATASET_DIR/generated_mimic_with_cameras.hdf5" \
   --headless \
   --enable_cameras \
   --overwrite
 ```
 
-Smoke test only two episodes:
+Smoke test only a few episodes:
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/data/replay_dataset_with_cameras.py \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/data/replay_dataset_with_cameras.py" \
   --task Isaac-SO-ARM101-Cube-I4H-Replay-Camera-v0 \
-  --input_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_32env_96trial.hdf5 \
-  --output_file /tmp/generated_with_cameras_smoke.hdf5 \
-  --headless \
-  --enable_cameras \
+  --input_file "$DATASET_DIR/generated_mimic.hdf5" \
+  --output_file "$DATASET_DIR/generated_mimic_with_cameras_smoke.hdf5" \
   --max_episodes 2 \
+  --headless \
+  --enable_cameras \
   --overwrite
 ```
 
-Inspect camera presence:
+Inspect camera datasets:
 
 ```bash
-/home/insol02/IH_ws/IsaacLab/isaaclab.sh -p \
-  /home/insol02/IH_ws/so101_IsaacLab/tools/data/inspect_hdf5.py \
-  /tmp/generated_with_cameras_smoke.hdf5 \
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/data/inspect_hdf5.py" \
+  "$DATASET_DIR/generated_mimic_with_cameras_smoke.hdf5" \
   --check-cameras \
   --stats \
   --episode 0
@@ -346,23 +382,21 @@ Inspect camera presence:
 Expected camera datasets:
 
 ```text
-data/demo_X/camera_obs/wrist  [T, 480, 640, 3] uint8
-data/demo_X/camera_obs/up     [T, 480, 640, 3] uint8
+data/demo_X/camera_obs/wrist  [T, H, W, 3] uint8
+data/demo_X/camera_obs/up     [T, H, W, 3] uint8
 ```
 
 ---
 
-## 10. Export Isaac HDF5 with cameras to LeRobot
-
-The converter uses a reference LeRobot `meta/info.json` as the schema authority, preserves camera feature names, resamples from Isaac 50 Hz to the reference FPS, and writes videos.
+## Step 7: export camera-augmented Isaac HDF5 to LeRobot
 
 ### Standard LeRobot export
 
 ```bash
-python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_isaac_hdf5_to_lerobot_so101.py \
-  --input_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_32env_96trial_with_cameras.hdf5 \
-  --out /home/insol02/IH_ws/so101_IsaacLab/datasets/lerobot_mimic_i4h_camera \
-  --reference-info /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place/meta/info.json \
+python "$SO101_REPO/tools/data/convert_isaac_hdf5_to_lerobot_so101.py" \
+  --input_file "$DATASET_DIR/generated_mimic_with_cameras.hdf5" \
+  --out "$DATASET_DIR/lerobot_mimic_camera" \
+  --reference-info "$REFERENCE_INFO" \
   --fallback-source-fps 50 \
   --task "Pick up the cube and place it in the goal region." \
   --only-with-cameras \
@@ -371,15 +405,13 @@ python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_isaac_hdf5_to_lerob
   --overwrite
 ```
 
-### VLA Foundry compatibility export
-
-Some VLA Foundry tutorial preprocessors expect `episode_*.parquet` filenames and image/video reference columns inside the parquet. Use:
+### VLA Foundry-compatible LeRobot export
 
 ```bash
-python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_isaac_hdf5_to_lerobot_so101.py \
-  --input_file /home/insol02/IH_ws/so101_IsaacLab/datasets/generated_mimic_i4h_32env_96trial_with_cameras.hdf5 \
-  --out /home/insol02/IH_ws/so101_IsaacLab/datasets/lerobot_mimic_i4h_vla_compat \
-  --reference-info /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place/meta/info.json \
+python "$SO101_REPO/tools/data/convert_isaac_hdf5_to_lerobot_so101.py" \
+  --input_file "$DATASET_DIR/generated_mimic_with_cameras.hdf5" \
+  --out "$DATASET_DIR/lerobot_mimic_vla_compat" \
+  --reference-info "$REFERENCE_INFO" \
   --fallback-source-fps 50 \
   --task "Pick up the cube and place it in the goal region." \
   --only-with-cameras \
@@ -389,13 +421,13 @@ python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_isaac_hdf5_to_lerob
   --overwrite
 ```
 
-For a 2-episode test:
+For a small subset:
 
 ```bash
-python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_isaac_hdf5_to_lerobot_so101.py \
-  --input_file /home/insol02/IH_ws/so101_IsaacLab/datasets/successful_mimics_with_cameras_added_post_2trials_test.hdf5 \
-  --out /home/insol02/IH_ws/so101_IsaacLab/datasets/lerobot_mimic_i4h_2ep_vla_compat \
-  --reference-info /home/insol02/IH_ws/so101_IsaacLab/datasets/so101_pickplace_cube_1020_same_place/meta/info.json \
+python "$SO101_REPO/tools/data/convert_isaac_hdf5_to_lerobot_so101.py" \
+  --input_file "$DATASET_DIR/generated_mimic_with_cameras.hdf5" \
+  --out "$DATASET_DIR/lerobot_mimic_vla_compat_subset" \
+  --reference-info "$REFERENCE_INFO" \
   --fallback-source-fps 50 \
   --task "Pick up the cube and place it in the goal region." \
   --episode-indices 0,1 \
@@ -406,15 +438,20 @@ python /home/insol02/IH_ws/so101_IsaacLab/tools/data/convert_isaac_hdf5_to_lerob
   --overwrite
 ```
 
-Inspect:
+Inspect exported columns:
 
 ```bash
 python - <<'PY'
 import pandas as pd
-p = "/home/insol02/IH_ws/so101_IsaacLab/datasets/lerobot_mimic_i4h_2ep_vla_compat/data/chunk-000/episode_000000.parquet"
-df = pd.read_parquet(p)
+from pathlib import Path
+
+dataset = Path("datasets/lerobot_mimic_vla_compat_subset")
+parquet = sorted((dataset / "data").glob("**/*.parquet"))[0]
+df = pd.read_parquet(parquet)
+
+print(parquet)
 print(df.columns.tolist())
-print(df[["observation.images.wrist", "observation.images.up"]].head())
+print(df.head())
 PY
 ```
 
@@ -427,46 +464,163 @@ observation.images.up
 
 ---
 
-## 11. VLA Foundry smoke test notes
+## Step 8: preprocess LeRobot data for VLA Foundry
 
-Inside the VLA Foundry repo:
+Use the VLA Foundry environment.
 
 ```bash
-cd /home/insol02/IH_ws/vla_foundry
-
-mkdir -p tutorials/data/so101_i4h_mimic_2ep
-
-ln -sfn \
-  /home/insol02/IH_ws/so101_IsaacLab/datasets/lerobot_mimic_i4h_2ep_vla_compat \
-  tutorials/data/so101_i4h_mimic_2ep/lerobot_vla_compat
+cd "$VLA_FOUNDRY_ROOT"
 ```
 
-Preprocessing uses full LeRobot feature names:
+Preprocess the exported LeRobot dataset:
 
-```python
-SO101_CAMERAS = [
-    "observation.images.wrist",
-    "observation.images.up",
-]
+```bash
+uv run python "$SO101_REPO/tools/vla_foundry_so101/preprocess_so101.py" \
+  --compat-root "$DATASET_DIR/lerobot_mimic_vla_compat_subset" \
+  --output-root "$VLA_FOUNDRY_ROOT/tutorials/data/so101_mimic_preprocessed" \
+  --past-lowdim-steps 2 \
+  --future-lowdim-steps 60 \
+  --resize 224 224 \
+  --num-workers 1
 ```
 
-The training cell uses short names:
-
-```python
-cameras = '["wrist","up"]'
-```
-
-For the tutorial model, resize preprocessing images to 224x224 because the Stage-2 VLM/VLA config uses `--data.image_size 224`:
+The converter uses full feature names during preprocessing:
 
 ```text
---resize_images_size "[224,224]"
+observation.images.wrist
+observation.images.up
 ```
-
-A 2-episode run only validates the data path and training loop. It is not a meaningful policy training result.
 
 ---
 
-## 12. Common pitfalls
+## Step 9: train a VLA Foundry diffusion policy
+
+Use the VLA Foundry environment.
+
+```bash
+cd "$VLA_FOUNDRY_ROOT"
+```
+
+Train:
+
+```bash
+uv run python "$SO101_REPO/tools/vla_foundry_so101/train_vla.py" \
+  --preproc-root "$VLA_FOUNDRY_ROOT/tutorials/data/so101_mimic_preprocessed" \
+  --past-lowdim-timesteps 2 \
+  --future-lowdim-timesteps 60 \
+  --per-gpu-batch-size 16 \
+  --global-batch-size 16 \
+  --total-train-samples 300000 \
+  --num-checkpoints 10 \
+  --max-checkpoint-limit 10
+```
+
+The training script uses short camera names:
+
+```text
+wrist
+up
+```
+
+The future low-dimensional timestep value controls the future action horizon. The number of diffusion denoising steps is controlled later during inference/evaluation.
+
+---
+
+## Step 10: run offline VLA diagnostics
+
+### Single-sample action prediction check
+
+```bash
+cd "$VLA_FOUNDRY_ROOT"
+
+uv run python "$SO101_REPO/tools/vla_foundry_so101/vla_vibe_check.py" \
+  --checkpoint-dir /path/to/vla_checkpoint_dir \
+  --preproc-root "$VLA_FOUNDRY_ROOT/tutorials/data/so101_mimic_preprocessed" \
+  --sample-index 0 \
+  --num-inference-steps 10 \
+  --out-dir "$VLA_FOUNDRY_ROOT/tutorials/diagnostics/vla_vibe_check"
+```
+
+This plots:
+
+```text
+ground-truth normalized action vs predicted normalized action
+ground-truth denormalized action vs predicted denormalized action
+camera views used by the policy
+```
+
+### Anchor sweep
+
+```bash
+cd "$VLA_FOUNDRY_ROOT"
+
+uv run python "$SO101_REPO/tools/vla_foundry_so101/vla_anchor_sweep.py" \
+  --checkpoint-dir /path/to/vla_checkpoint_dir \
+  --preproc-root "$VLA_FOUNDRY_ROOT/tutorials/data/so101_mimic_preprocessed" \
+  --max-samples 20 \
+  --num-inference-steps 10 \
+  --out-dir "$VLA_FOUNDRY_ROOT/tutorials/diagnostics/vla_anchor_sweep"
+```
+
+Use this to determine whether the model predicts well across approach, grasp, lift, and place phases before running live simulation.
+
+---
+
+## Step 11: run live Isaac Lab VLA evaluation
+
+Use the Isaac Lab environment, but expose the VLA Foundry repository on `PYTHONPATH`.
+
+```bash
+export PYTHONUNBUFFERED=1
+export VLA_FOUNDRY_ROOT=/path/to/vla_foundry
+export PYTHONPATH="$VLA_FOUNDRY_ROOT:$PYTHONPATH"
+export LD_PRELOAD="$LD_PRELOAD:/lib/aarch64-linux-gnu/libgomp.so.1"
+```
+
+Run:
+
+```bash
+"$ISAACLAB_ROOT/isaaclab.sh" -p \
+  "$SO101_REPO/tools/eval/eval_vla_foundry_so101.py" \
+  --task Isaac-SO-ARM101-Cube-I4H-Replay-Camera-v0 \
+  --checkpoint_dir /path/to/vla_checkpoint_dir \
+  --max_steps 800 \
+  --reset_steps 12 \
+  --warm_start_action="-0.135,-1.62,1.69,1.29,-1.759,0.36" \
+  --warm_start_steps 200 \
+  --replan_steps 10 \
+  --execute_start_offset 1 \
+  --num_inference_steps 10 \
+  --respect_policy_fps \
+  --policy_fps 30 \
+  --env_fps 50 \
+  --action_smoothing 0.1 \
+  --debug_every 10 \
+  --enable_cameras
+```
+
+Key runtime settings:
+
+```text
+replan_steps
+  Number of predicted future actions to execute before asking the model for a new action chunk.
+
+execute_start_offset
+  Offset after the past-action slots. Use this to skip the anchor/current slot if needed.
+
+num_inference_steps
+  Number of diffusion denoising steps used when generating an action chunk.
+
+respect_policy_fps
+  Repeats policy actions as needed so training FPS and simulation control FPS are not accidentally mismatched.
+
+action_smoothing
+  Low-pass smoothing applied to executed denormalized actions.
+```
+
+---
+
+## Common pitfalls
 
 ### Negative command-line values
 
@@ -482,47 +636,72 @@ Good:
 --root-pos="-0.02079,-0.01576,-0.03248"
 ```
 
-### Tiny/truncated HDF5 files
+### Camera-enabled tasks require `--enable_cameras`
 
-If you see:
+If a camera-enabled task is launched without this flag, Isaac Lab can fail during camera sensor initialization.
+
+### Do not assume video count from directory count
+
+Use:
+
+```bash
+find /path/to/dataset/videos -type f | wc -l
+```
+
+not:
+
+```bash
+find /path/to/dataset/videos | wc -l
+```
+
+because the second form counts directories too.
+
+### LeRobot subsets must use compact episode indices
+
+If a subset contains only two episodes, make sure episode indices are compact:
 
 ```text
-OSError: truncated file: eof = 96, stored_eof = 2048
+0, 1
 ```
 
-then a script probably opened an output HDF5 and crashed before writing valid content. Use timestamped output files and safe read-only copies.
-
-### Multi-env success checks
-
-If `num_envs=1` succeeds but `num_envs>1` fails, inspect coordinate frames. Success regions are usually env-local, while `root_state_w` is world-frame. Use:
-
-```python
-pos_local = obj.data.root_state_w[:, 0:3] - env.scene.env_origins
-```
-
-### Cameras missing from HDF5
-
-Camera tensors only appear if the camera-enabled replay task is used and camera observations are explicitly recorded.
-
-### VLA Foundry cannot discover cameras
-
-If VLA Foundry says:
+not sparse original IDs such as:
 
 ```text
-No image columns found in parquet files
+27, 65
 ```
 
-export with:
+Some preprocessing code indexes episode metadata using `entries[episode_index]`, so sparse episode IDs can produce `IndexError`.
+
+### VLA Foundry relative checkpoint paths
+
+VLA Foundry model configs may contain relative checkpoint paths. Run offline diagnostics from the VLA Foundry repository root, or ensure the evaluator changes current working directory to the VLA Foundry root before model construction.
+
+### Large batch size can reduce optimizer steps
+
+For overfit diagnostics, count optimizer steps:
 
 ```text
---vla-foundry-compat
+optimizer steps ≈ total_train_samples / global_batch_size
 ```
 
-This writes `episode_*.parquet` files and image reference columns such as `observation.images.wrist`.
+A large batch can make a run look long in sample count but short in optimizer updates.
 
 ---
 
-## 13. Git / data hygiene
+## Git and data hygiene
+
+Commit:
+
+```text
+src/
+tools/
+docs/
+README.md
+pyproject.toml
+LICENSE
+CITATION.cff
+.gitignore
+```
 
 Do not commit:
 
@@ -533,31 +712,30 @@ outputs/
 *.hdf5
 *.mp4
 *.pt
+*.pth
+*.ckpt
 *.tar
 *.parquet
+*.png
+*.jpg
+*.jpeg
+.local_env_snapshots/
+README_old*.md
 ```
 
-Commit:
+For environment reproducibility, prefer curated files under:
 
 ```text
-src/
-tools/
-README.md
-pyproject.toml
-LICENSE
-CITATION.cff
-.gitignore
+docs/env/
 ```
 
-For reproducible experiments, store commands and dataset filenames in README notes or small text files, not the datasets themselves.
+such as:
 
----
+```text
+env_from_history.yml
+env_full_export.yml
+key_versions.txt
+notes.md
+```
 
-## 14. Next work
-
-1. Render cameras for all successful generated Mimic episodes.
-2. Export the full synthetic dataset to LeRobot and VLA Foundry-compatible formats.
-3. Train/evaluate real-only, synthetic-only, and mixed real+synthetic datasets.
-4. Add Isaac Lab closed-loop evaluation for the fine-tuned VLA.
-5. Compare Pinocchio Mimic generation against Diff IK Mimic after annotation fixes.
-6. Add dataset metadata attributes such as `source_fps`, `sim_dt`, `decimation`, and env/task name directly into HDF5 outputs.
+Avoid committing large or noisy full `pip freeze` dumps unless they are explicitly needed for debugging.

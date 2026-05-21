@@ -1,0 +1,10 @@
+Patched draccus/parsers/yaml_loader.py in env_so101_vla_isaaclab using the working file from /home/insol02/IH_ws/vla_foundry/.venv/lib/python3.12/site-packages/draccus/parsers/yaml_loader.py
+
+WORKING STATE:
+- env_so101_vla_isaaclab cloned from env_so101_IsaacLab.
+- VLA Foundry source imported via PYTHONPATH=/home/insol02/IH_ws/vla_foundry.
+- Isaac Lab launcher uses /home/insol02/miniconda3/envs/env_so101_vla_isaaclab/bin/python.
+- RoboticsProcessor load: OK.
+- Model load checkpoint_6.pt: OK.
+- generate_actions on SO101 preprocessed tar sample: OK.
+- draccus/parsers/yaml_loader.py was copied from the VLA Foundry uv env because same reported version 0.11.5 had different source in pip/conda env.
