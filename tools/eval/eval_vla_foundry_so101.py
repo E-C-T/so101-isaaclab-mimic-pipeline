@@ -39,6 +39,10 @@ from dataclasses import dataclass
 from typing import Any
 from pathlib import Path
 
+import numpy as np
+import torch
+from isaaclab.app import AppLauncher
+
 
 def checkpoint_sort_key(path):
     """Sort checkpoint_*.pt files by numeric checkpoint index."""
@@ -47,10 +51,6 @@ def checkpoint_sort_key(path):
     name = Path(path).name
     m = re.search(r"checkpoint_(\d+)\.pt$", name)
     return int(m.group(1)) if m else -1
-
-import numpy as np
-import torch
-from isaaclab.app import AppLauncher
 
 
 # -----------------------------------------------------------------------------
@@ -79,7 +79,19 @@ parser.add_argument(
 parser.add_argument("--num_envs", type=int, default=1, help="Number of Isaac Lab envs. Start with 1.")
 parser.add_argument("--max_steps", type=int, default=500, help="Max env steps for one rollout.")
 parser.add_argument("--reset_steps", type=int, default=40, help="Settling steps after env reset.")
-parser.add_argument("--replan_steps", type=int, default=3, help="Number of predicted actions to execute before replanning.")
+parser.add_argument("--replan_steps", type=int, default=3, help="Legacy mode: number of predicted actions to execute before replanning. If --plan_every_steps/--chunk_horizon_steps are unset, this controls both planning cadence and executed chunk length.")
+parser.add_argument(
+    "--plan_every_steps",
+    type=int,
+    default=None,
+    help="How often, in policy-action steps, to run VLA inference. If unset, defaults to --replan_steps. Use 1 for every-policy-step replanning.",
+)
+parser.add_argument(
+    "--chunk_horizon_steps",
+    type=int,
+    default=None,
+    help="How many predicted future policy actions to keep from each chunk. If unset, defaults to --replan_steps. Use with --temporal_ensemble to keep a long horizon while replanning frequently.",
+)
 parser.add_argument(
     "--execute_start_offset",
     type=int,
@@ -98,6 +110,29 @@ parser.add_argument("--up_camera_key", type=str, default="up_camera")
 parser.add_argument("--robot_key", type=str, default="robot")
 parser.add_argument("--object_key", type=str, default="object")
 parser.add_argument("--debug_every", type=int, default=10)
+parser.add_argument(
+    "--stop_on_success",
+    action="store_true",
+    help="Stop the rollout immediately when the goal condition is first reached. By default, keep running until --max_steps so you can inspect post-success behavior.",
+)
+parser.add_argument(
+    "--plan_debug_every",
+    type=int,
+    default=0,
+    help="Print full predicted action chunks every N planning calls. 0 disables chunk printing. Use this instead of debug_every for plan_every_steps=1.",
+)
+parser.add_argument(
+    "--boundary_debug_every",
+    type=int,
+    default=0,
+    help="When --log_chunk_boundaries is set, print boundary diagnostics every N planning calls. 0 disables boundary prints except success/debug step lines.",
+)
+parser.add_argument(
+    "--max_plan_print_actions",
+    type=int,
+    default=8,
+    help="Maximum number of action rows to print from each predicted chunk when --plan_debug_every is enabled. Use -1 to print all rows.",
+)
 parser.add_argument(
     "--action_smoothing",
     type=float,
@@ -151,6 +186,30 @@ parser.add_argument(
     help="Number of env steps to hold/interpolate toward warm_start_action before rollout.",
 )
 parser.add_argument(
+    "--set_initial_joint_pos",
+    type=str,
+    default=None,
+    help="Optional comma-separated 6D absolute joint position to write directly into sim before rollout. Useful for exact dataset-aligned starts.",
+)
+parser.add_argument(
+    "--set_initial_settle_steps",
+    type=int,
+    default=5,
+    help="Number of hold-action env steps after --set_initial_joint_pos to refresh sim/cameras.",
+)
+parser.add_argument(
+    "--save_debug_images",
+    type=str,
+    default=None,
+    help="Optional directory to save wrist/up RGB frames at rollout start and each planning call.",
+)
+parser.add_argument(
+    "--save_debug_images_every_plan",
+    type=int,
+    default=1,
+    help="Save debug images every N planning calls when --save_debug_images is set.",
+)
+parser.add_argument(
     "--clip_to_action_stats",
     action="store_true",
     default=True,
@@ -166,6 +225,17 @@ parser.add_argument(
     "--dry_run_inference",
     action="store_true",
     help="Only reset, capture cameras, run one inference call, print predicted actions, and exit.",
+)
+parser.add_argument(
+    "--log_chunk_boundaries",
+    action="store_true",
+    help="Print jump diagnostics whenever a new VLA action chunk is planned.",
+)
+parser.add_argument(
+    "--rollout_log_npz",
+    type=str,
+    default=None,
+    help="Optional path to save rollout q/action/object/success/boundary logs as .npz.",
 )
 parser.add_argument(
     "--disable_fabric",
@@ -360,6 +430,87 @@ def parse_action_csv(s: str) -> np.ndarray:
     return np.asarray(vals, dtype=np.float32)
 
 
+def save_rgb_image(path: str | Path, rgb: np.ndarray) -> None:
+    """Save a uint8 RGB image for camera-visibility debugging."""
+    from PIL import Image
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.fromarray(_as_uint8_rgb(rgb)).save(path)
+
+
+def maybe_save_debug_images(
+    out_dir: str | None,
+    tag: str,
+    wrist_rgb: np.ndarray,
+    up_rgb: np.ndarray,
+) -> None:
+    if out_dir is None:
+        return
+    out = Path(out_dir)
+    save_rgb_image(out / f"{tag}_wrist.png", wrist_rgb)
+    save_rgb_image(out / f"{tag}_up.png", up_rgb)
+
+
+def set_robot_joint_state_direct(env, q6: np.ndarray, robot_key: str = "robot", settle_steps: int = 5) -> None:
+    """Best-effort direct write of a 6D absolute SO101 joint position into Isaac sim."""
+    q6 = np.asarray(q6, dtype=np.float32)
+    if q6.shape != (6,):
+        raise ValueError(f"Expected q6 shape (6,), got {q6.shape}")
+
+    robot = env.unwrapped.scene[robot_key]
+    device = env.unwrapped.device
+
+    q_full = robot.data.joint_pos.clone()
+    qd_full = robot.data.joint_vel.clone() if hasattr(robot.data, "joint_vel") else torch.zeros_like(q_full)
+
+    if q_full.shape[1] < 6:
+        raise ValueError(f"Expected at least 6 joints, got joint_pos shape={q_full.shape}")
+
+    q_full[:, :6] = torch.as_tensor(q6, device=device, dtype=q_full.dtype)
+    qd_full[:, :6] = 0.0
+
+    print(f"[SET INITIAL] target q6={q6}")
+
+    wrote = False
+    errors = []
+    for call in (
+        lambda: robot.write_joint_state_to_sim(q_full, qd_full),
+        lambda: robot.write_joint_state_to_sim(q_full, qd_full, env_ids=None),
+        lambda: robot.write_joint_position_to_sim(q_full),
+        lambda: robot.write_joint_position_to_sim(q_full, env_ids=None),
+    ):
+        try:
+            call()
+            wrote = True
+            break
+        except Exception as e:  # noqa: BLE001
+            errors.append(repr(e))
+
+    if not wrote:
+        raise RuntimeError(
+            "Could not directly write robot joint state. Tried common Isaac Lab articulation APIs. "
+            f"Errors: {errors}"
+        )
+
+    try:
+        env.unwrapped.scene.write_data_to_sim()
+    except Exception:
+        pass
+
+    try:
+        env.unwrapped.sim.forward()
+    except Exception:
+        pass
+
+    hold = q6.copy()
+    for _ in range(max(0, int(settle_steps))):
+        step_env(env, hold)
+
+    q_after = get_joint_state_action(env, robot_key)
+    print(f"[SET INITIAL] achieved q6={q_after}")
+
+
 def move_to_action_smooth(env, target_action: np.ndarray, num_steps: int = 80):
     """Smoothly move from current joint position to target joint-position action."""
     q0 = get_joint_state_action(env)
@@ -458,6 +609,7 @@ class SO101VLAState:
     curr_wrist: np.ndarray
     curr_up: np.ndarray
     action_history: collections.deque
+    state_history: collections.deque
 
 
 class VLAFoundrySO101Runner:
@@ -473,10 +625,7 @@ class VLAFoundrySO101Runner:
         self.num_inference_steps = num_inference_steps
         self.clip_to_action_stats = clip_to_action_stats
 
-        ckpts = sorted(
-            glob.glob(os.path.join(checkpoint_dir, "checkpoints", "checkpoint_*.pt")),
-            key=checkpoint_sort_key,
-        )
+        ckpts = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoints", "checkpoint_*.pt")))
         if not ckpts:
             raise FileNotFoundError(f"No checkpoint_*.pt found in {checkpoint_dir}/checkpoints")
         self.ckpt_path = ckpts[-1]
@@ -524,12 +673,23 @@ class VLAFoundrySO101Runner:
         print("[VLA] action_min:", self.action_min)
         print("[VLA] action_max:", self.action_max)
 
-    def initialize_state(self, wrist_rgb: np.ndarray, up_rgb: np.ndarray, current_action: np.ndarray) -> SO101VLAState:
+    def initialize_state(
+        self,
+        wrist_rgb: np.ndarray,
+        up_rgb: np.ndarray,
+        current_action: np.ndarray,
+        current_state: np.ndarray | None = None,
+    ) -> SO101VLAState:
         action_history = collections.deque(maxlen=self.lowdim_past_timesteps)
+        state_history = collections.deque(maxlen=self.lowdim_past_timesteps)
 
-        # Seed past action history with current joint-position action.
+        current_action = np.asarray(current_action, dtype=np.float32).copy()
+        current_state = current_action if current_state is None else np.asarray(current_state, dtype=np.float32).copy()
+
+        # Seed past action/state histories with the current absolute joint position.
         for _ in range(self.lowdim_past_timesteps):
-            action_history.append(np.asarray(current_action, dtype=np.float32).copy())
+            action_history.append(current_action.copy())
+            state_history.append(current_state.copy())
 
         return SO101VLAState(
             prev_wrist=wrist_rgb.copy(),
@@ -537,6 +697,7 @@ class VLAFoundrySO101Runner:
             curr_wrist=wrist_rgb.copy(),
             curr_up=up_rgb.copy(),
             action_history=action_history,
+            state_history=state_history,
         )
 
     def update_images(self, state: SO101VLAState, wrist_rgb: np.ndarray, up_rgb: np.ndarray) -> None:
@@ -547,6 +708,9 @@ class VLAFoundrySO101Runner:
 
     def append_executed_action(self, state: SO101VLAState, action: np.ndarray) -> None:
         state.action_history.append(np.asarray(action, dtype=np.float32).copy())
+
+    def append_measured_state(self, state: SO101VLAState, measured_state: np.ndarray) -> None:
+        state.state_history.append(np.asarray(measured_state, dtype=np.float32).copy())
 
     def _build_action_sequence(self, state: SO101VLAState, current_action: np.ndarray) -> torch.Tensor:
         """Build [17,6] action tensor: 2 past + 1 present/dummy + 14 future/dummy."""
@@ -569,10 +733,18 @@ class VLAFoundrySO101Runner:
         arr = np.stack(seq, axis=0).astype(np.float32)
         return torch.as_tensor(arr, dtype=torch.float32)
 
-    def _build_proprioception_sequence(self, current_state: np.ndarray) -> torch.Tensor:
-        """Build [past+present,6] proprioception tensor."""
+    def _build_proprioception_sequence(self, state: SO101VLAState, current_state: np.ndarray) -> torch.Tensor:
+        """Build [past+present,6] proprioception tensor using true measured state history."""
         current_state = np.asarray(current_state, dtype=np.float32)
-        arr = np.stack([current_state.copy()] * (self.lowdim_past_timesteps + 1), axis=0)
+        if current_state.shape != (6,):
+            raise ValueError(f"Expected current_state shape (6,), got {current_state.shape}")
+
+        hist = list(state.state_history)
+        if len(hist) < self.lowdim_past_timesteps:
+            hist = [current_state.copy()] * (self.lowdim_past_timesteps - len(hist)) + hist
+
+        seq = hist[-self.lowdim_past_timesteps :] + [current_state.copy()]
+        arr = np.stack(seq, axis=0).astype(np.float32)
         return torch.as_tensor(arr, dtype=torch.float32)
 
     def infer_action_chunk(self, state: SO101VLAState, current_state: np.ndarray, current_action: np.ndarray) -> np.ndarray:
@@ -586,7 +758,7 @@ class VLAFoundrySO101Runner:
 
         lowdim = {
             "action": self._build_action_sequence(state, current_action),
-            "observation.state": self._build_proprioception_sequence(current_state),
+            "observation.state": self._build_proprioception_sequence(state, current_state),
         }
 
         processor_input = {
@@ -689,6 +861,16 @@ def main():
         target = parse_action_csv(args_cli.warm_start_action)
         move_to_action_smooth(env, target, num_steps=args_cli.warm_start_steps)
 
+    # Optional exact dataset-aligned state write. This happens after warm-start if both are supplied.
+    if args_cli.set_initial_joint_pos is not None:
+        q_init = parse_action_csv(args_cli.set_initial_joint_pos)
+        set_robot_joint_state_direct(
+            env,
+            q_init,
+            robot_key=args_cli.robot_key,
+            settle_steps=args_cli.set_initial_settle_steps,
+        )
+
     wrist = capture_camera_rgb(env, args_cli.wrist_camera_key)
     up = capture_camera_rgb(env, args_cli.up_camera_key)
     q = get_joint_state_action(env, args_cli.robot_key)
@@ -697,6 +879,7 @@ def main():
     print("[INFO] Initial up image:", up.shape, up.dtype)
     print("[INFO] Initial joint/action:", q)
     print("[INFO] Initial object pos local:", get_object_pos_local(env, args_cli.object_key))
+    maybe_save_debug_images(args_cli.save_debug_images, "initial", wrist, up)
 
     runner = VLAFoundrySO101Runner(
         checkpoint_dir=args_cli.checkpoint_dir,
@@ -705,29 +888,56 @@ def main():
         clip_to_action_stats=args_cli.clip_to_action_stats,
     )
 
-    state = runner.initialize_state(wrist, up, q)
+    state = runner.initialize_state(wrist, up, current_action=q, current_state=q)
 
     if args_cli.dry_run_inference:
         action_chunk = runner.infer_action_chunk(state, current_state=q, current_action=q)
         start = runner.lowdim_past_timesteps + args_cli.execute_start_offset
+        dry_horizon = args_cli.chunk_horizon_steps if args_cli.chunk_horizon_steps is not None else args_cli.replan_steps
         print("[DRY RUN] action_chunk shape:", action_chunk.shape)
         print("[DRY RUN] first executable actions:")
-        for i in range(start, min(start + args_cli.replan_steps, action_chunk.shape[0])):
+        for i in range(start, min(start + dry_horizon, action_chunk.shape[0])):
             print(f"  idx={i}: {action_chunk[i]}")
         env.close()
         return
 
     action_plan: collections.deque[np.ndarray] = collections.deque()
     ever_success = False
+    first_success_step = None
     prev_executed_action = get_joint_state_action(env, args_cli.robot_key)
+    last_executed_action = None
     policy_action_counter = 0
     env_action_counter = 0
+    plan_id = 0
+
+    rollout_log = {
+        "step": [],
+        "env_action_counter": [],
+        "policy_action_counter": [],
+        "plan_id": [],
+        "is_new_plan": [],
+        "q": [],
+        "q_after": [],
+        "executed_action": [],
+        "object_pos": [],
+        "success": [],
+    }
+
     temporal_ensembler = TemporalActionEnsembler(
         max_window=args_cli.temporal_ensemble_window,
         decay=args_cli.temporal_ensemble_decay,
     ) if args_cli.temporal_ensemble else None
 
+    plan_every_steps = args_cli.plan_every_steps if args_cli.plan_every_steps is not None else args_cli.replan_steps
+    chunk_horizon_steps = args_cli.chunk_horizon_steps if args_cli.chunk_horizon_steps is not None else args_cli.replan_steps
+    plan_every_steps = max(1, int(plan_every_steps))
+    chunk_horizon_steps = max(1, int(chunk_horizon_steps))
+
     print("[INFO] Starting closed-loop rollout...")
+    print(f"[INFO] plan_every_steps={plan_every_steps}")
+    print(f"[INFO] chunk_horizon_steps={chunk_horizon_steps}")
+    print(f"[INFO] temporal_ensemble={args_cli.temporal_ensemble}")
+
     with torch.inference_mode():
         for t in range(args_cli.max_steps):
             wrist = capture_camera_rgb(env, args_cli.wrist_camera_key)
@@ -735,15 +945,58 @@ def main():
             runner.update_images(state, wrist, up)
 
             q = get_joint_state_action(env, args_cli.robot_key)
+            is_new_plan = False
 
-            if not action_plan:
+            should_plan = False
+            if temporal_ensembler is not None:
+                should_plan = (t % plan_every_steps == 0)
+            else:
+                should_plan = (not action_plan) or (t % plan_every_steps == 0)
+
+            if should_plan:
                 action_chunk = runner.infer_action_chunk(state, current_state=q, current_action=q)
 
                 # Execute predictions after the past slots.
                 # Offset=1 skips the anchor/present slot and starts at the first true future action.
                 start = runner.lowdim_past_timesteps + args_cli.execute_start_offset
-                end = min(start + args_cli.replan_steps, action_chunk.shape[0])
+                end = min(start + chunk_horizon_steps, action_chunk.shape[0])
                 chunk_to_execute = [a.copy() for a in action_chunk[start:end]]
+
+                is_new_plan = True
+                plan_id += 1
+
+                if (
+                    args_cli.save_debug_images is not None
+                    and args_cli.save_debug_images_every_plan > 0
+                    and (plan_id % args_cli.save_debug_images_every_plan == 0)
+                ):
+                    maybe_save_debug_images(args_cli.save_debug_images, f"plan_{plan_id:04d}_t_{t:04d}", wrist, up)
+
+                should_print_boundary = (
+                    args_cli.log_chunk_boundaries
+                    and len(chunk_to_execute) > 0
+                    and args_cli.boundary_debug_every > 0
+                    and (plan_id % args_cli.boundary_debug_every == 0)
+                )
+                if should_print_boundary:
+                    new_first_action = chunk_to_execute[0]
+                    jump_from_q = float(np.linalg.norm(new_first_action - q))
+                    if last_executed_action is None:
+                        jump_from_last = float("nan")
+                    else:
+                        jump_from_last = float(np.linalg.norm(new_first_action - last_executed_action))
+
+                    print(
+                        f"[BOUNDARY t={t} plan_id={plan_id}] "
+                        f"start={start} end={end} "
+                        f"||first-current_q||={jump_from_q:.6f} "
+                        f"||first-last_exec||={jump_from_last:.6f}"
+                    )
+                    print(f"  current_q:      {q}")
+                    print(f"  last_executed:  {last_executed_action}")
+                    print(f"  first_action:   {new_first_action}")
+                    if len(chunk_to_execute) > 1:
+                        print(f"  second_action:  {chunk_to_execute[1]}")
 
                 if temporal_ensembler is not None:
                     repeat_counts = []
@@ -760,19 +1013,32 @@ def main():
                         repeat_counts.append(rc)
                         local_policy_counter += 1
 
-                    temporal_ensembler.add_chunk(
-                        current_step=env_action_counter,
-                        actions=np.stack(chunk_to_execute, axis=0),
-                        repeat_counts=repeat_counts,
-                    )
+                    if len(chunk_to_execute) > 0:
+                        temporal_ensembler.add_chunk(
+                            current_step=env_action_counter,
+                            actions=np.stack(chunk_to_execute, axis=0),
+                            repeat_counts=repeat_counts,
+                        )
                 else:
+                    # In non-ensemble mode, a new plan replaces any unexecuted remainder.
+                    # For plan_every_steps=1, prefer --temporal_ensemble so long-horizon chunks are not discarded.
+                    action_plan.clear()
                     for a in chunk_to_execute:
                         action_plan.append(a.copy())
 
-                if args_cli.debug_every > 0:
-                    print(f"[PLAN t={t}] action_chunk[{start}:{end}]")
-                    for i in range(start, end):
+                should_print_plan = (
+                    args_cli.plan_debug_every > 0
+                    and (plan_id % args_cli.plan_debug_every == 0)
+                )
+                if should_print_plan:
+                    print(f"[PLAN t={t} plan_id={plan_id}] action_chunk[{start}:{end}]")
+                    plan_indices = list(range(start, end))
+                    if args_cli.max_plan_print_actions >= 0:
+                        plan_indices = plan_indices[: args_cli.max_plan_print_actions]
+                    for i in plan_indices:
                         print(f"  idx={i}: {action_chunk[i]}")
+                    if args_cli.max_plan_print_actions >= 0 and end - start > args_cli.max_plan_print_actions:
+                        print(f"  ... skipped {end - start - args_cli.max_plan_print_actions} actions")
 
             if temporal_ensembler is not None:
                 raw_action = temporal_ensembler.get(env_action_counter)
@@ -781,6 +1047,9 @@ def main():
                     action_plan.clear()
                     continue
             else:
+                if not action_plan:
+                    # This can occur if chunk_horizon_steps is zero after clipping or if planning failed.
+                    continue
                 raw_action = action_plan.popleft()
 
             if args_cli.action_smoothing > 0.0:
@@ -792,6 +1061,7 @@ def main():
 
             runner.append_executed_action(state, action)
             prev_executed_action = action.copy()
+            last_executed_action = action.copy()
 
             repeat_count = 1
             if args_cli.respect_policy_fps:
@@ -803,27 +1073,65 @@ def main():
             policy_action_counter += 1
 
             success = False
+            success_this_policy_step = False
             for _repeat_i in range(repeat_count):
                 step_env(env, action)
                 env_action_counter += 1
                 success = is_object_in_goal(env)
-                ever_success = ever_success or success
-                if success:
+                success_this_policy_step = success_this_policy_step or success
+
+                if success and not ever_success:
+                    ever_success = True
+                    first_success_step = t
+                    print(f"[SUCCESS] First success reached at policy step {t}, env_action_counter={env_action_counter}.")
+
+                if success and args_cli.stop_on_success:
                     break
 
-            if args_cli.debug_every > 0 and (t % args_cli.debug_every == 0 or success):
-                obj_pos = get_object_pos_local(env, args_cli.object_key)
+            success = success_this_policy_step
+
+            q_after = get_joint_state_action(env, args_cli.robot_key)
+            runner.append_measured_state(state, q_after)
+            obj_pos = get_object_pos_local(env, args_cli.object_key)
+
+            if args_cli.rollout_log_npz is not None:
+                rollout_log["step"].append(t)
+                rollout_log["env_action_counter"].append(env_action_counter)
+                rollout_log["policy_action_counter"].append(policy_action_counter)
+                rollout_log["plan_id"].append(plan_id)
+                rollout_log["is_new_plan"].append(is_new_plan)
+                rollout_log["q"].append(q.copy())
+                rollout_log["q_after"].append(q_after.copy())
+                rollout_log["executed_action"].append(action.copy())
+                rollout_log["object_pos"].append(
+                    obj_pos.copy() if obj_pos is not None else np.full(3, np.nan, dtype=np.float32)
+                )
+                rollout_log["success"].append(bool(success))
+
+            should_print_step = args_cli.debug_every > 0 and (t % args_cli.debug_every == 0)
+            # If --stop_on_success is enabled, also print the terminal success step.
+            if args_cli.stop_on_success and success:
+                should_print_step = True
+
+            if should_print_step:
                 print(
                     f"[STEP {t:04d}] repeat={repeat_count} success={success} ever_success={ever_success} "
                     f"obj_local={obj_pos} action={action}"
                 )
 
-            if success:
-                print(f"[DONE] Success reached at step {t}.")
+            if success and args_cli.stop_on_success:
+                print(f"[DONE] Success reached at step {t}; stopping because --stop_on_success is set.")
                 break
 
     print("[RESULT] ever_success:", ever_success)
+    print("[RESULT] first_success_step:", first_success_step)
     print("[RESULT] final_object_pos_local:", get_object_pos_local(env, args_cli.object_key))
+
+    if args_cli.rollout_log_npz is not None:
+        out_path = Path(args_cli.rollout_log_npz)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        np.savez(out_path, **{k: np.asarray(v) for k, v in rollout_log.items()})
+        print(f"[LOG] Saved rollout log to: {out_path}")
 
     env.close()
 
